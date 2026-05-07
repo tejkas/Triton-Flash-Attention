@@ -34,11 +34,12 @@ def _attn_fwd_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    CAUSAL_MASK: tl.constexpr,
 ):
     start_m = tl.program_id(0)        # which BLOCK_M of queries
     off_hz = tl.program_id(1)         # flattened (batch, head)
-    off_z = off_hz // H
-    off_h = off_hz % H
+    off_z = off_hz // H     # which batch
+    off_h = off_hz % H      # which attention head
 
     # Skip to the (z, h) slab in each tensor.
     q_offset = off_z * stride_qz + off_h * stride_qh
@@ -85,36 +86,77 @@ def _attn_fwd_kernel(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
+    # Logs base 2 is easier to calculate
     qk_scale = sm_scale * LOG2E   # fold log2(e) into the scale once
 
     # Q stays resident in registers/SRAM for the whole loop.
     q = tl.load(Q_block_ptr)
 
-    for start_n in range(0, N_CTX, BLOCK_N):
+    #  Implement causal masking. 
+    #  boundary is the maximum position in K/V whose entire block can be used to compute attention
+    #  i.e, block boundary is < start_m
+    if CAUSAL_MASK:
+        # If masking, we can completely use K/V tokens until this point
+        boundary = start_m * BLOCK_M
+    else:
+        # Else, use full sequence N_CTX is sequence length
+        boundary = N_CTX
+
+    # Iterate K/V to process masked blocks
+    for start_n in range(0, boundary, BLOCK_N):
         k = tl.load(K_block_ptr)
         v = tl.load(V_block_ptr)
 
-        # Scores for this tile, fp32 accumulator.
-        qk = tl.dot(q, k)                              # (BLOCK_M, BLOCK_N)
+        # k is already transposed in the block pointer initialization
+        # scores for this tile, fp32 accumulator
+        qk = tl.dot(q, k) 
 
-        # --- online softmax update ---
-        # 1. New running max (in log2 space).
+        # Online Softmax update step
+
+        # running max
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1) * qk_scale)
-        # 2. Local probabilities, normalized to the new max.
+        # normalized local probabilities
         p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
-        # 3. Correction factor that rescales OLD state to the new max.
+        # correction scaling factor
         alpha = tl.math.exp2(m_i - m_ij)
-        # 4. Update denom and output accumulator.
+
+        # update running sum and output
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
-        acc = tl.dot(p.to(v.dtype), v, acc)            # acc += p @ v
-        # 5. Commit new max.
+        acc = tl.dot(p.to(v.dtype, v, acc)) # acc += p @ v
+        # set new max
         m_i = m_ij
-        # -----------------------------
 
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
+    # Iterate K/V to process diagonal blocks (with a mix of masked and unmasked values)
+    if CAUSAL_MASK:
+        # Current q index
+        q_idx = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        # Iterate K/V (only one block of Q)
+        for start_n in range(start_m * BLOCK_M, (start_m + 1) * BLOCK_M, BLOCK_N):
+            k = tl.load(K_block_ptr)
+            v = tl.load(V_block_ptr)
+
+            qk = tl.dot(q, k) 
+
+            k_idx = start_n + tl.arange(0, BLOCK_N)
+            # Causal Masking rule: Q index needs to be >= than the index of K
+            causal_mask = q_idx[:, None] >= k_idx[None, :]
+            qk = tl.where(causal_mask, qk, -1e6) # Set masked values to -inf to let softmax probabilities flow to 0
+
+            # Remainder is just normal softmax update logic
+            m_ij = tl.maximum(m_i, tl.max(qk, axis=1) * qk_scale)
+            p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
+            alpha = tl.math.exp2(m_i - m_ij)
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None]
+            acc = tl.dot(p.to(v.dtype, v, acc)) # acc += p @ v
+            m_i = m_ij
+
+            K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+            V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
     # Final normalize: divide by the accumulated denominator.
     acc = acc / l_i[:, None]
 
@@ -125,7 +167,7 @@ def _attn_fwd_kernel(
     tl.store(O_block_ptr, acc.to(O.type.element_ty))
 
 
-def flash_attn_forward(q, k, v, sm_scale=None):
+def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
     """Non-causal FlashAttention forward.
 
     Args:
@@ -159,6 +201,7 @@ def flash_attn_forward(q, k, v, sm_scale=None):
     o = torch.empty_like(q)
     lse = torch.empty((Z, H, N), device=q.device, dtype=torch.float32)
 
+    # Tiling Q matrix, N/BLOCK_M
     grid = (triton.cdiv(N, BLOCK_M), Z * H, 1)
     _attn_fwd_kernel[grid](
         q, k, v, o, lse,
@@ -171,6 +214,7 @@ def flash_attn_forward(q, k, v, sm_scale=None):
         HEAD_DIM=D,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        CAUSAL_MASK=causal,
         num_warps=4 if D <= 64 else 8,
         num_stages=3,
     )
