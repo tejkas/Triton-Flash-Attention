@@ -123,7 +123,7 @@ def _attn_fwd_kernel(
         # update running sum and output
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
-        acc = tl.dot(p.to(v.dtype, v, acc)) # acc += p @ v
+        acc = tl.dot(p.to(v.dtype), v, acc) # acc += p @ v
         # set new max
         m_i = m_ij
 
@@ -152,7 +152,7 @@ def _attn_fwd_kernel(
             alpha = tl.math.exp2(m_i - m_ij)
             l_i = l_i * alpha + tl.sum(p, axis=1)
             acc = acc * alpha[:, None]
-            acc = tl.dot(p.to(v.dtype, v, acc)) # acc += p @ v
+            acc = tl.dot(p.to(v.dtype), v, acc) # acc += p @ v
             m_i = m_ij
 
             K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
