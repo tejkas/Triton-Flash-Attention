@@ -39,7 +39,7 @@ def _attn_fwd_kernel(
     start_m = tl.program_id(0)        # which BLOCK_M of queries
     off_hz = tl.program_id(1)         # flattened (batch, head)
     off_z = off_hz // H     # which batch
-    off_h = off_hz % H      # which attention head
+    off_h = off_hz % H      # which attentGotion head
 
     # Skip to the (z, h) slab in each tensor.
     q_offset = off_z * stride_qz + off_h * stride_qh
@@ -166,6 +166,57 @@ def _attn_fwd_kernel(
 
     tl.store(O_block_ptr, acc.to(O.type.element_ty))
 
+# Remember that dS = P ⊙ (dP - rowsum(<P, dP>)) where ⊙ is elementwise multiply
+# Rowwise, dS_i = P_i ⊙ (dP_i - rowsum(<P_i, dP_i>))
+# Preprocesses the delta_i vector (s.t delta_i = rowsum(<P_i, dP_i>) for all rows i in P)
+# delta_i is just rowsum(<P_i, dP_i> = Σ_j P_ij * dP_ij
+#                                    = Σ_j P_ij * (dO_i · V_j)
+#                                    = dO_i · (Σ_j P_ij * V_j)
+#                                    = dO_i · O_i
+@triton.jit
+def _attn_bwd_preprocess(
+    O, dO, Delta,
+    stride_oz, stride_oh, stride_om, stride_ok,
+    stride_doz, stride_doh, stride_dom, stride_dok,
+    H, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    start_m = tl.program_id(0)        # which BLOCK_M of queries
+    off_hz = tl.program_id(1)         # flattened (batch, head)
+    off_z = off_hz // H     # which batch
+    off_h = off_hz % H      # which attentGotion head
+
+    o_offset = off_z * stride_oz + off_h * stride_oh
+    # dO starts at the same batch/head offsets as O
+    do_offset = off_z * stride_doz + off_h * stride_doh
+
+    O_block_ptr = tl.make_block_ptr(
+        base=O + o_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_om, stride_ok),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+    dO_block_ptr = tl.make_block_ptr(
+        base=dO + do_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_dom, stride_dok),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    # accumulate as fp32
+    o = tl.load(O_block_ptr).to(tl.float32) 
+    do = tl.load(dO_block_ptr).to(tl.float32)
+
+    delta = tl.sum(o * do, axis=1) # element wise multiply. BUT, sum across the HEAD_DIM axis.
+
+    # Address to HBM and store
+    delta_ptrs = Delta + off_hz * N_CTX + start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    tl.store(delta_ptrs, delta)
 
 def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
     """Non-causal FlashAttention forward.
@@ -199,7 +250,7 @@ def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
     )
 
     o = torch.empty_like(q)
-    lse = torch.empty((Z, H, N), device=q.device, dtype=torch.float32)
+    lse = torch.empty((Z, H, N), device=q.device, dtype=torch.float32) #Where logsumexp vector is stored
 
     # Tiling Q matrix, N/BLOCK_M
     grid = (triton.cdiv(N, BLOCK_M), Z * H, 1)
