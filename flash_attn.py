@@ -345,6 +345,107 @@ def _attn_bwd_dkdv(
     tl.store(dV_block_ptr, dv.to(v.dtype))
     tl.store(dK_block_ptr, dk.to(k.dtype))
 
+@triton.jit
+def _attn_bwd_dq(
+    Q, K, V, sm_scale,
+    dO, dQ,
+    LSE, Delta,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_doz, stride_doh, stride_dom, stride_dok,
+    stride_dqz, stride_dqh, stride_dqm, stride_dqk,
+    H, N_CTX,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M:  tl.constexpr,
+    BLOCK_N:  tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    off_hz  = tl.program_id(1)
+    off_z   = off_hz // H
+    off_h   = off_hz % H
+
+    q_offset  = off_z * stride_qz  + off_h * stride_qh
+    k_offset  = off_z * stride_kz  + off_h * stride_kh
+    v_offset  = off_z * stride_vz  + off_h * stride_vh
+    do_offset = off_z * stride_doz + off_h * stride_doh
+    dq_offset = off_z * stride_dqz + off_h * stride_dqh
+    
+    Q_block_ptr = tl.make_block_ptr(
+          base=Q + q_offset,
+          shape=(N_CTX, HEAD_DIM),
+          strides=(stride_qm, stride_qk),
+          offsets=(start_m * BLOCK_M, 0),
+          block_shape=(BLOCK_M, HEAD_DIM),
+          order=(1, 0),
+      )
+    dO_block_ptr = tl.make_block_ptr(
+        base=dO + do_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_dom, stride_dok),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+    dQ_block_ptr = tl.make_block_ptr(
+        base=dQ + dq_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_dqm, stride_dqk),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        base=K + k_offset,
+        shape=(HEAD_DIM, N_CTX),
+        strides=(stride_kk, stride_kn),
+        offsets=(0, 0),
+        block_shape=(HEAD_DIM, BLOCK_N),
+        order=(0, 1),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        base=V + v_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_vn, stride_vk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, HEAD_DIM),
+        order=(1, 0),
+    )
+    # LSE and Delta for this program's slice of Q
+    lse_ptrs   = LSE   + off_hz * N_CTX + start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    delta_ptrs = Delta + off_hz * N_CTX + start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+
+    # Load query matrix data once before loop
+    q     = tl.load(Q_block_ptr)
+    do    = tl.load(dO_block_ptr)
+    lse   = tl.load(lse_ptrs)
+    delta = tl.load(delta_ptrs)
+
+    dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    for start_n in range(0, N_CTX, BLOCK_N):
+        k = tl.load(K_block_ptr)
+        v = tl.load(V_block_ptr)
+
+        # Calculate P tile on the fly from Q, K and logsumexp, don't need to materialize full P matrix
+        qk = tl.dot(q, k)
+        p = tl.math.exp2(qk * (sm_scale * LOG2E) - lse[:, None])
+
+        # dp = do @ V^T
+        dp = tl.dot(do, tl.trans(v))
+
+        # softmax backward pass - dS = P ⊙ (dP - delta) where ⊙ is elementwise multiplication
+        ds = p * (dp.to(tl.float32) - delta[:, None])
+
+        # dq = ds @ k
+        dq += tl.dot(ds.to(q.dtype), tl.trans(k)) * sm_scale
+
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+    
+    tl.store(dQ_block_ptr, dq.to(q.dtype))
+
 def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
     """FlashAttention forward.
 
