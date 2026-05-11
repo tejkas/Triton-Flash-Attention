@@ -584,4 +584,4 @@ class FlashAttention(torch.autograd.Function):
 def flash_attention(q, k, v, sm_scale=None, causal=False):
     if sm_scale is None:
         sm_scale = 1.0 / (q.shape[-1] ** 0.5)
-    return FlashAttention.apply(q, k, v, sm_scale, causal
+    return FlashAttention.apply(q, k, v, sm_scale, causal)

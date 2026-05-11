@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flash_attn import flash_attn_forward
+from flash_attn import flash_attn_forward, flash_attention
 
 
 def _reference(q, k, v, sm_scale):
@@ -105,3 +105,83 @@ def test_matches_torch_sdpa():
     ref = F.scaled_dot_product_attention(q, k, v, is_causal=False, scale=sm_scale)
 
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=0)
+
+def test_backward_matches_torch_sdpa():
+      torch.manual_seed(0)
+      Z, H, N, D = 2, 4, 512, 64
+
+      q = torch.randn(Z, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True)
+      k = torch.randn(Z, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True)
+      v = torch.randn(Z, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True)
+      sm_scale = 1.0 / (D ** 0.5)
+
+      # Reference: PyTorch SDPA
+      q_ref = q.detach().clone().requires_grad_(True)
+      k_ref = k.detach().clone().requires_grad_(True)
+      v_ref = v.detach().clone().requires_grad_(True)
+
+      # Forward + backward through our kernel
+      o = flash_attention(q, k, v, sm_scale)
+      o.sum().backward()
+
+      # Forward + backward through torch SDPA
+      o_ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale)
+      o_ref.sum().backward()
+
+      atol = 1e-2
+      torch.testing.assert_close(q.grad, q_ref.grad, atol=atol, rtol=0)
+      torch.testing.assert_close(k.grad, k_ref.grad, atol=atol, rtol=0)
+      torch.testing.assert_close(v.grad, v_ref.grad, atol=atol, rtol=0)
+
+@pytest.mark.parametrize("Z,H,N,D", [
+      (1, 2, 128, 64),
+      (2, 4, 256, 64),
+      (1, 8, 512, 64),
+      (2, 2, 1024, 128),
+  ])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_backward_matches_reference(Z, H, N, D, dtype):
+    torch.manual_seed(0)
+    q = torch.randn(Z, H, N, D, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(Z, H, N, D, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(Z, H, N, D, device="cuda", dtype=dtype, requires_grad=True)
+    sm_scale = 1.0 / (D ** 0.5)
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+
+    o = flash_attention(q, k, v, sm_scale)
+    o.sum().backward()
+
+    o_ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale)
+    o_ref.sum().backward()
+
+    atol = 1e-2 if dtype is torch.float16 else 2e-2
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=atol, rtol=0)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=atol, rtol=0)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=atol, rtol=0)
+
+def test_causal_backward_matches_torch_sdpa():
+    torch.manual_seed(0)
+    Z, H, N, D = 2, 4, 512, 64
+
+    q = torch.randn(Z, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(Z, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True)
+    v = torch.randn(Z, H, N, D, device="cuda", dtype=torch.float16, requires_grad=True)
+    sm_scale = 1.0 / (D ** 0.5)
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+
+    o = flash_attention(q, k, v, sm_scale, causal=True)
+    o.sum().backward()
+
+    o_ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, scale=sm_scale, is_causal=True)
+    o_ref.sum().backward()
+
+    atol = 1e-2
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=atol, rtol=0)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=atol, rtol=0)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=atol, rtol=0)
