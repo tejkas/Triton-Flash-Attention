@@ -446,6 +446,9 @@ def _attn_bwd_dq(
     
     tl.store(dQ_block_ptr, dq.to(q.dtype))
 
+# ----------------------------------------------------------
+# Wrappers for Forward/Backwards Passes
+
 def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
     """FlashAttention forward.
 
@@ -498,3 +501,87 @@ def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
         num_stages=3,
     )
     return o, lse
+
+def flash_attn_backward(dO, q, k, v, o, lse, sm_scale, causal=False):
+    Z, H, N, D = q.shape
+
+    BLOCK_M = 128 if D <= 64 else 64
+    BLOCK_N = 64 if D <= 64 else 32
+
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+    delta = torch.empty((Z, H, N), device=q.device, dtype=torch.float32)
+
+    preprocess_grid = (triton.cdiv(N, BLOCK_M), Z * H)
+    _attn_bwd_preprocess[preprocess_grid](
+        o, dO, delta,
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        dO.stride(0), dO.stride(1), dO.stride(2), dO.stride(3),
+        H, N,
+        HEAD_DIM=D,
+        BLOCK_M=BLOCK_M,
+    )
+
+    dkdv_grid = (triton.cdiv(N, BLOCK_N), Z * H)
+    _attn_bwd_dkdv[dkdv_grid](
+        q, k, v, sm_scale,
+        dO, dk, dv,
+        lse, delta,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        dO.stride(0), dO.stride(1), dO.stride(2), dO.stride(3),
+        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+        H, N,
+        HEAD_DIM=D,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        IS_CAUSAL=causal,
+        num_warps=4 if D <= 64 else 8,
+        num_stages=1,
+    )
+
+    dq_grid = (triton.cdiv(N, BLOCK_M), Z * H)
+    _attn_bwd_dq[dq_grid](
+        q, k, v, sm_scale,
+        dO, dq,
+        lse, delta,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        dO.stride(0), dO.stride(1), dO.stride(2), dO.stride(3),
+        dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+        H, N,
+        HEAD_DIM=D,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        IS_CAUSAL=causal,
+        num_warps=4 if D <= 64 else 8,
+        num_stages=1,
+    )
+
+    return dq, dk, dv
+
+# To slot into PyTorch forward() and backward()
+class FlashAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, sm_scale, causal):
+        o, lse = flash_attn_forward(q, k, v, sm_scale, causal)
+        # Save these tensors for the backwards pass
+        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.sm_scale = sm_scale
+        ctx.causal = causal
+        return o
+    
+    @staticmethod
+    def backward(ctx, dO):
+        q, k, v, o, lse = ctx.saved_tensors
+        dq, dk, dv = flash_attn_backward(dO, q, k, v, o, lse, ctx.sm_scale, ctx.causal)
+        return dq, dk, dv, None, None
+
+def flash_attention(q, k, v, sm_scale=None, causal=False):
+    if sm_scale is None:
+        sm_scale = 1.0 / (q.shape[-1] ** 0.5)
+    return FlashAttention.apply(q, k, v, sm_scale, causal
