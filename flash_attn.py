@@ -1,11 +1,19 @@
 """
-Stage 1: non-causal FlashAttention forward.
+FlashAttention 2.0 Triton implementation, including:
+- Forward pass,
+- Causal masking,
+- Backwards pass
 
 Inputs are laid out as (Z, H, N, D):
     Z = batch size
     H = number of heads
-    N = sequence length (must be a multiple of BLOCK_N for stage 1)
+    N = sequence length (must be a multiple of BLOCK_N)
     D = head dimension (16, 32, 64, 128, or 256)
+
+stride_z = H*N*D   ← skip a whole (H, N, D) slab
+stride_h = N*D     ← skip a whole (N, D) head
+stride_m = D       ← skip one row (one token)
+stride_k = 1       ← move one element along D (contiguous)
 
 The kernel walks K/V tiles once, maintaining the running softmax max (m_i),
 denominator (l_i), and weighted-V accumulator (acc) — never materializing the
@@ -39,7 +47,7 @@ def _attn_fwd_kernel(
     start_m = tl.program_id(0)        # which BLOCK_M of queries
     off_hz = tl.program_id(1)         # flattened (batch, head)
     off_z = off_hz // H     # which batch
-    off_h = off_hz % H      # which attentGotion head
+    off_h = off_hz % H      # which attention head
 
     # Skip to the (z, h) slab in each tensor.
     q_offset = off_z * stride_qz + off_h * stride_qh
@@ -185,7 +193,7 @@ def _attn_bwd_preprocess(
     start_m = tl.program_id(0)        # which BLOCK_M of queries
     off_hz = tl.program_id(1)         # flattened (batch, head)
     off_z = off_hz // H     # which batch
-    off_h = off_hz % H      # which attentGotion head
+    off_h = off_hz % H      # which attention head
 
     o_offset = off_z * stride_oz + off_h * stride_oh
     # dO starts at the same batch/head offsets as O
@@ -218,8 +226,127 @@ def _attn_bwd_preprocess(
     delta_ptrs = Delta + off_hz * N_CTX + start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     tl.store(delta_ptrs, delta)
 
+# dK, dV kernel for backprop through K, V
+@triton.jit
+def _attn_bwd_dkdv(
+      Q, K, V, sm_scale,
+      dO, dK, dV,
+      LSE, Delta,
+      stride_qz, stride_qh, stride_qm, stride_qk,
+      stride_kz, stride_kh, stride_kn, stride_kk,
+      stride_vz, stride_vh, stride_vn, stride_vk,
+      stride_doz, stride_doh, stride_dom, stride_dok,
+      stride_dkz, stride_dkh, stride_dkn, stride_dkk,
+      stride_dvz, stride_dvh, stride_dvn, stride_dvk,
+      H, N_CTX,
+      HEAD_DIM: tl.constexpr,
+      BLOCK_M: tl.constexpr,
+      BLOCK_N: tl.constexpr,
+      IS_CAUSAL: tl.constexpr,
+  ):
+    start_n = tl.program_id(0) # which BLOCK_N of K/V
+    off_hz  = tl.program_id(1) # flattened (batch, head)
+    off_z   = off_hz // H # which batch
+    off_h   = off_hz % H # which attention head
+
+    # offsets
+    q_offset  = off_z * stride_qz  + off_h * stride_qh
+    k_offset  = off_z * stride_kz  + off_h * stride_kh
+    v_offset  = off_z * stride_vz  + off_h * stride_vh
+    do_offset = off_z * stride_doz + off_h * stride_doh
+    dk_offset = off_z * stride_dkz + off_h * stride_dkh
+    dv_offset = off_z * stride_dvz + off_h * stride_dvh
+
+    # K, V - instantiate pointers, load from HBM, allocate mem
+    K_block_ptr = tl.make_block_ptr(
+          base=K + k_offset,
+          shape=(HEAD_DIM, N_CTX),
+          strides=(stride_kk, stride_kn),
+          offsets=(0, start_n * BLOCK_N),
+          block_shape=(HEAD_DIM, BLOCK_N),
+          order=(0, 1),
+      )
+    V_block_ptr = tl.make_block_ptr(
+        base=V + v_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_vn, stride_vk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, HEAD_DIM),
+        order=(1, 0),
+    )
+
+    k = tl.load(K_block_ptr)
+    v = tl.load(V_block_ptr)
+
+    dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+
+    # Q, dO - instantiate pointers, load from HBM, allocate mem
+    Q_block_ptr = tl.make_block_ptr(
+          base=Q + q_offset,
+          shape=(N_CTX, HEAD_DIM),
+          strides=(stride_qm, stride_qk),
+          offsets=(0, 0),
+          block_shape=(BLOCK_M, HEAD_DIM),
+          order=(1, 0),
+      )
+    dO_block_ptr = tl.make_block_ptr(
+        base=dO + do_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_dom, stride_dok),
+        offsets=(0, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0),
+    )
+    lse_ptrs   = LSE   + off_hz * N_CTX + tl.arange(0, BLOCK_M)
+    delta_ptrs = Delta + off_hz * N_CTX + tl.arange(0, BLOCK_M)
+
+    for start_m in range(0, N_CTX, BLOCK_M):
+        q = tl.load(Q_block_ptr)
+        do = tl.load(dO_block_ptr)
+        lse = tl.load(lse_ptrs)
+        delta = tl.load(delta_ptrs)
+
+        # Calculate P tile on the fly from Q, K and logsumexp, don't need to materialize full P matrix
+        qk = tl.dot(q, k)
+        p = tl.math.exp2(qk * (sm_scale * LOG2E) - lse[:, None])
+
+        # dV += P^T @ dO (Chain Rule)
+        dv = tl.dot(tl.trans(p).to(do.dtype), do, dv)
+
+        # softmax backward pass - dS = P ⊙ (dP - delta) where ⊙ is elementwise multiplication
+        dp = tl.dot(do, tl.trans(v))
+        ds = p * (dp.to(tl.float32) - delta[:, None])
+
+        # dK += dS^T @ Q * sm_scale
+        dk += tl.dot(tl.trans(ds).to(q.dtype), q) * sm_scale
+
+        Q_block_ptr  = tl.advance(Q_block_ptr,  (BLOCK_M, 0))
+        dO_block_ptr = tl.advance(dO_block_ptr, (BLOCK_M, 0))
+        lse_ptrs   += BLOCK_M
+        delta_ptrs += BLOCK_M
+    
+    dK_block_ptr = tl.make_block_ptr(
+          base=dK + dk_offset,
+          shape=(N_CTX, HEAD_DIM), # no transpose needed for storing dK
+          strides=(stride_dkn, stride_dkk),
+          offsets=(start_n * BLOCK_N, 0),
+          block_shape=(BLOCK_N, HEAD_DIM),
+          order=(1, 0),
+      )
+    dV_block_ptr = tl.make_block_ptr(
+        base=dV + dv_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_dvn, stride_dvk),
+        offsets=(start_n * BLOCK_N, 0),
+        block_shape=(BLOCK_N, HEAD_DIM),
+        order=(1, 0),
+    )
+    tl.store(dV_block_ptr, dv.to(v.dtype))
+    tl.store(dK_block_ptr, dk.to(k.dtype))
+
 def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
-    """Non-causal FlashAttention forward.
+    """FlashAttention forward.
 
     Args:
         q, k, v: (Z, H, N, D) tensors, contiguous, fp16 or bf16.
