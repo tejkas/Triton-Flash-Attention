@@ -29,6 +29,8 @@ import triton.language as tl
 # log2(e) — multiply scores by this once so we can use exp2 in the loop.
 LOG2E = 1.4426950408889634
 
+# ----------------------------------------------------------
+# Kernels
 
 @triton.jit
 def _attn_fwd_kernel(
@@ -281,12 +283,18 @@ def _attn_bwd_dkdv(
     dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
+    # Causal Masking
+    if IS_CAUSAL:
+        boundary = start_n * BLOCK_N
+    else:
+        boundary = 0
+
     # Q, dO - instantiate pointers, load from HBM, allocate mem
     Q_block_ptr = tl.make_block_ptr(
           base=Q + q_offset,
           shape=(N_CTX, HEAD_DIM),
           strides=(stride_qm, stride_qk),
-          offsets=(0, 0),
+          offsets=(boundary, 0),
           block_shape=(BLOCK_M, HEAD_DIM),
           order=(1, 0),
       )
@@ -294,14 +302,15 @@ def _attn_bwd_dkdv(
         base=dO + do_offset,
         shape=(N_CTX, HEAD_DIM),
         strides=(stride_dom, stride_dok),
-        offsets=(0, 0),
+        offsets=(boundary, 0),
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0),
     )
-    lse_ptrs   = LSE   + off_hz * N_CTX + tl.arange(0, BLOCK_M)
-    delta_ptrs = Delta + off_hz * N_CTX + tl.arange(0, BLOCK_M)
+    lse_ptrs   = LSE   + off_hz * N_CTX + boundary + tl.arange(0, BLOCK_M)
+    delta_ptrs = Delta + off_hz * N_CTX + boundary + tl.arange(0, BLOCK_M)
 
-    for start_m in range(0, N_CTX, BLOCK_M):
+    # Streaming for Tiles of Q
+    for start_m in range(boundary, N_CTX, BLOCK_M):
         q = tl.load(Q_block_ptr)
         do = tl.load(dO_block_ptr)
         lse = tl.load(lse_ptrs)
@@ -310,6 +319,13 @@ def _attn_bwd_dkdv(
         # Calculate P tile on the fly from Q, K and logsumexp, don't need to materialize full P matrix
         qk = tl.dot(q, k)
         p = tl.math.exp2(qk * (sm_scale * LOG2E) - lse[:, None])
+
+        if IS_CAUSAL:
+            q_idx = start_m + tl.arange(0, BLOCK_M)
+            k_idx = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+            causal_mask = q_idx[:, None] >= k_idx[None, :]
+            # If q_idx > k_idx, we should set the weight to 0
+            p = tl.where(causal_mask, p, 0.0)
 
         # dV += P^T @ dO (Chain Rule)
         dv = tl.dot(tl.trans(p).to(do.dtype), do, dv)
@@ -371,6 +387,11 @@ def _attn_bwd_dq(
     v_offset  = off_z * stride_vz  + off_h * stride_vh
     do_offset = off_z * stride_doz + off_h * stride_doh
     dq_offset = off_z * stride_dqz + off_h * stride_dqh
+
+    if IS_CAUSAL:
+        boundary = (start_m + 1) * BLOCK_M
+    else:
+        boundary = N_CTX
     
     Q_block_ptr = tl.make_block_ptr(
           base=Q + q_offset,
@@ -424,13 +445,19 @@ def _attn_bwd_dq(
 
     dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    for start_n in range(0, N_CTX, BLOCK_N):
+    for start_n in range(0, boundary, BLOCK_N):
         k = tl.load(K_block_ptr)
         v = tl.load(V_block_ptr)
 
         # Calculate P tile on the fly from Q, K and logsumexp, don't need to materialize full P matrix
         qk = tl.dot(q, k)
         p = tl.math.exp2(qk * (sm_scale * LOG2E) - lse[:, None])
+
+        if IS_CAUSAL:
+            q_idx = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+            k_idx = start_n + tl.arange(0, BLOCK_N)
+            causal_mask = q_idx[:, None] >= k_idx[None, :]
+            p = tl.where(causal_mask, p, 0.0)
 
         # dp = do @ V^T
         dp = tl.dot(do, tl.trans(v))
@@ -564,6 +591,7 @@ def flash_attn_backward(dO, q, k, v, o, lse, sm_scale, causal=False):
 
     return dq, dk, dv
 
+# ----------------------------------------------------------
 # To slot into PyTorch forward() and backward()
 class FlashAttention(torch.autograd.Function):
     @staticmethod
