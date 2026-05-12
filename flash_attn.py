@@ -32,6 +32,19 @@ LOG2E = tl.constexpr(1.4426950408889634)
 # ----------------------------------------------------------
 # Kernels
 
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64},  num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64},  num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32},  num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32},  num_warps=8, num_stages=2),
+    ],
+    key=['N_CTX', 'HEAD_DIM'],
+)
 @triton.jit
 def _attn_fwd_kernel(
     Q, K, V, O, M,
@@ -229,6 +242,16 @@ def _attn_bwd_preprocess(
     tl.store(delta_ptrs, delta)
 
 # dK, dV kernel for backprop through K, V
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64},  num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32},  num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32},  num_warps=8, num_stages=1),
+    ],
+    key=['N_CTX', 'HEAD_DIM'],
+)
 @triton.jit
 def _attn_bwd_dkdv(
       Q, K, V, sm_scale,
@@ -362,6 +385,16 @@ def _attn_bwd_dkdv(
     tl.store(dV_block_ptr, dv.to(v.dtype))
     tl.store(dK_block_ptr, dk.to(k.dtype))
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64},  num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64},  num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32},  num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 32},  num_warps=8, num_stages=1),
+    ],
+    key=['N_CTX', 'HEAD_DIM'],
+)
 @triton.jit
 def _attn_bwd_dq(
     Q, K, V, sm_scale,
@@ -498,21 +531,11 @@ def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
     if sm_scale is None:
         sm_scale = 1.0 / (D ** 0.5)
 
-    BLOCK_M = 128 if D <= 64 else 64 # Q block size
-    BLOCK_N = 64 if D <= 64 else 32 # K/V Block size
-    assert N % BLOCK_N == 0, (
-        f"stage 1 requires N ({N}) to be a multiple of BLOCK_N ({BLOCK_N}); "
-        "ragged tails are handled in a later stage"
-    )
-    assert N % BLOCK_M == 0, (
-        f"stage 1 requires N ({N}) to be a multiple of BLOCK_M ({BLOCK_M})"
-    )
-
     o = torch.empty_like(q)
     lse = torch.empty((Z, H, N), device=q.device, dtype=torch.float32) #Where logsumexp vector is stored
 
     # Tiling Q matrix, N/BLOCK_M
-    grid = (triton.cdiv(N, BLOCK_M), Z * H, 1)
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_M']), Z * H, 1)
     _attn_fwd_kernel[grid](
         q, k, v, o, lse,
         sm_scale,
@@ -522,11 +545,7 @@ def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         H, N,
         HEAD_DIM=D,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         CAUSAL_MASK=causal,
-        num_warps=4 if D <= 64 else 8,
-        num_stages=3,
     )
     return o, lse
 
@@ -534,7 +553,6 @@ def flash_attn_backward(dO, q, k, v, o, lse, sm_scale, causal=False):
     Z, H, N, D = q.shape
 
     BLOCK_M = 128 if D <= 64 else 64
-    BLOCK_N = 64 if D <= 64 else 32
 
     dq = torch.zeros_like(q)
     dk = torch.zeros_like(k)
@@ -551,7 +569,7 @@ def flash_attn_backward(dO, q, k, v, o, lse, sm_scale, causal=False):
         BLOCK_M=BLOCK_M,
     )
 
-    dkdv_grid = (triton.cdiv(N, BLOCK_N), Z * H)
+    dkdv_grid = lambda meta: (triton.cdiv(N, meta['BLOCK_N']), Z * H)
     _attn_bwd_dkdv[dkdv_grid](
         q, k, v, sm_scale,
         dO, dk, dv,
@@ -564,14 +582,10 @@ def flash_attn_backward(dO, q, k, v, o, lse, sm_scale, causal=False):
         dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
         H, N,
         HEAD_DIM=D,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         IS_CAUSAL=causal,
-        num_warps=4 if D <= 64 else 8,
-        num_stages=1,
     )
 
-    dq_grid = (triton.cdiv(N, BLOCK_M), Z * H)
+    dq_grid = lambda meta: (triton.cdiv(N, meta['BLOCK_M']), Z * H)
     _attn_bwd_dq[dq_grid](
         q, k, v, sm_scale,
         dO, dq,
@@ -583,11 +597,7 @@ def flash_attn_backward(dO, q, k, v, o, lse, sm_scale, causal=False):
         dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
         H, N,
         HEAD_DIM=D,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         IS_CAUSAL=causal,
-        num_warps=4 if D <= 64 else 8,
-        num_stages=1,
     )
 
     return dq, dk, dv
