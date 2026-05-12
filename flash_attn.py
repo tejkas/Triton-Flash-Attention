@@ -27,7 +27,7 @@ import triton.language as tl
 
 
 # log2(e) — multiply scores by this once so we can use exp2 in the loop.
-LOG2E = 1.4426950408889634
+LOG2E = tl.constexpr(1.4426950408889634)
 
 # ----------------------------------------------------------
 # Kernels
@@ -285,7 +285,8 @@ def _attn_bwd_dkdv(
 
     # Causal Masking
     if IS_CAUSAL:
-        boundary = start_n * BLOCK_N
+        # Align boundary to nearest Q tile
+        boundary = (start_n * BLOCK_N // BLOCK_M) * BLOCK_M
     else:
         boundary = 0
 
@@ -497,8 +498,8 @@ def flash_attn_forward(q, k, v, sm_scale=None, causal=False):
     if sm_scale is None:
         sm_scale = 1.0 / (D ** 0.5)
 
-    BLOCK_M = 128 if D <= 64 else 64
-    BLOCK_N = 64 if D <= 64 else 32
+    BLOCK_M = 128 if D <= 64 else 64 # Q block size
+    BLOCK_N = 64 if D <= 64 else 32 # K/V Block size
     assert N % BLOCK_N == 0, (
         f"stage 1 requires N ({N}) to be a multiple of BLOCK_N ({BLOCK_N}); "
         "ragged tails are handled in a later stage"
